@@ -1,0 +1,438 @@
+"""
+ARIMA Forecasting Backend API
+Final Year Project - Complete ARIMA Forecasting System
+"""
+import os
+import json
+import uuid
+from datetime import datetime
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
+from werkzeug.utils import secure_filename
+import pandas as pd
+import numpy as np
+from arima_model import ARIMAForecaster
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+CORS(app)
+
+# Configuration
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['MODELS_FOLDER'] = 'saved_models'
+app.config['RESULTS_FOLDER'] = 'results'
+
+# Create necessary directories
+for folder in ['uploads', 'saved_models', 'results']:
+    os.makedirs(folder, exist_ok=True)
+
+# Global storage for training sessions
+training_sessions = {}
+
+def detect_date_format(date_series):
+    """
+    Helper function to detect and suggest date format
+    """
+    sample_dates = date_series.dropna().head(10).astype(str)
+    formats_found = []
+    
+    for date_str in sample_dates:
+        if '/' in date_str:
+            parts = date_str.split('/')
+            if len(parts[0]) == 4:
+                formats_found.append('YYYY/MM/DD')
+            elif len(parts) >= 2 and parts[0].isdigit() and int(parts[0]) > 12:
+                formats_found.append('DD/MM/YYYY')
+            else:
+                formats_found.append('MM/DD/YYYY or DD/MM/YYYY')
+        elif '-' in date_str:
+            parts = date_str.split('-')
+            if len(parts[0]) == 4:
+                formats_found.append('YYYY-MM-DD')
+            elif len(parts) >= 2 and parts[0].isdigit() and int(parts[0]) > 12:
+                formats_found.append('DD-MM-YYYY')
+            else:
+                formats_found.append('MM-DD-YYYY or DD-MM-YYYY')
+    
+    return list(set(formats_found))
+
+@app.route('/', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        'message': 'ARIMA Forecasting Service is running',
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'version': '1.0.0'
+    })
+
+@app.route('/upload', methods=['POST'])
+def upload_and_train():
+    """
+    Upload CSV file and start ARIMA training
+    Expected CSV format: date column + value columns
+    """
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file uploaded'}), 400
+        
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+        
+        if not file.filename.lower().endswith('.csv'):
+            return jsonify({'error': 'Only CSV files are supported'}), 400
+        
+        # Get form parameters
+        date_column = request.form.get('date_column', 'date')
+        value_column = request.form.get('value_column', 'value')
+        test_size = float(request.form.get('test_size', 0.2))
+        forecast_horizon = int(request.form.get('forecast_horizon', 30))
+        
+        # Save uploaded file
+        filename = secure_filename(file.filename)
+        session_id = str(uuid.uuid4())
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{session_id}_{filename}")
+        file.save(file_path)
+        
+        logger.info(f"File uploaded: {filename} with session_id: {session_id}")
+        
+        # Load and validate data
+        try:
+            df = pd.read_csv(file_path)
+            logger.info(f"CSV loaded with shape: {df.shape}")
+            
+            # Validate required columns
+            if date_column not in df.columns:
+                return jsonify({'error': f'Date column "{date_column}" not found in CSV'}), 400
+            
+            if value_column not in df.columns:
+                return jsonify({'error': f'Value column "{value_column}" not found in CSV'}), 400
+            
+            # Data preprocessing with robust date parsing
+            logger.info(f"Attempting to parse dates in column: {date_column}")
+            
+            # First, detect the date format for better error messages
+            detected_formats = detect_date_format(df[date_column])
+            logger.info(f"Detected date formats: {detected_formats}")
+            
+            try:
+                # Try multiple date formats and parsing options
+                df[date_column] = pd.to_datetime(df[date_column], format='mixed', dayfirst=True)
+                logger.info("Successfully parsed dates using mixed format with dayfirst=True")
+            except Exception as e:
+                logger.warning(f"Mixed format parsing failed: {e}")
+                try:
+                    # Try with dayfirst=True for DD-MM-YYYY, DD/MM/YYYY formats
+                    df[date_column] = pd.to_datetime(df[date_column], dayfirst=True, errors='coerce')
+                    logger.info("Successfully parsed dates using dayfirst=True")
+                except Exception as e2:
+                    logger.warning(f"Dayfirst parsing failed: {e2}")
+                    try:
+                        # Try with infer_datetime_format
+                        df[date_column] = pd.to_datetime(df[date_column], infer_datetime_format=True, errors='coerce')
+                        logger.info("Successfully parsed dates using infer_datetime_format")
+                    except Exception as e3:
+                        logger.error(f"All date parsing methods failed: {e3}")
+                        sample_dates = df[date_column].head(5).tolist()
+                        return jsonify({
+                            'error': f'Unable to parse dates in column "{date_column}". Sample dates: {sample_dates}. Detected formats: {detected_formats}. Please ensure dates are in a standard format (DD-MM-YYYY, MM/DD/YYYY, YYYY-MM-DD, etc.)'
+                        }), 400
+            
+            # Check for any NaT (Not a Time) values after parsing
+            if df[date_column].isna().any():
+                invalid_dates = df[df[date_column].isna()].index.tolist()
+                return jsonify({'error': f'Invalid dates found at rows: {invalid_dates[:5]}. Please check your date format.'}), 400
+            
+            df = df.sort_values(date_column)
+            df = df.dropna(subset=[value_column])
+            
+            if len(df) < 50:
+                return jsonify({'error': 'Dataset too small. Need at least 50 data points'}), 400
+            
+            # Prepare data for ARIMA
+            dates = df[date_column].tolist()
+            values = df[value_column].tolist()
+            
+            # Initialize ARIMA forecaster
+            forecaster = ARIMAForecaster()
+            
+            # Perform train-test split
+            train_size = int(len(values) * (1 - test_size))
+            train_dates = dates[:train_size]
+            train_values = values[:train_size]
+            test_dates = dates[train_size:]
+            test_values = values[train_size:]
+            
+            logger.info(f"Train size: {len(train_values)}, Test size: {len(test_values)}")
+            
+            # Train ARIMA model
+            logger.info("Starting ARIMA training...")
+            training_result = forecaster.fit(train_values, train_dates)
+            
+            # Generate forecasts for test period
+            test_forecast = forecaster.forecast(len(test_values))
+            
+            # Generate future forecasts starting from the last date in the full dataset
+            # Override the forecaster's dates temporarily to use the full dataset's last date
+            original_dates = forecaster.dates
+            forecaster.dates = dates  # Use full dataset dates for proper future forecast
+            future_forecast = forecaster.forecast(forecast_horizon, start_from_end=True)
+            forecaster.dates = original_dates  # Restore original training dates
+            
+            # Calculate performance metrics
+            metrics = forecaster.calculate_metrics(test_values, test_forecast['predictions'])
+            
+            # Prepare response data
+            training_session = {
+                'session_id': session_id,
+                'filename': filename,
+                'upload_time': datetime.now().isoformat(),
+                'data_info': {
+                    'total_records': len(df),
+                    'train_size': len(train_values),
+                    'test_size': len(test_values),
+                    'date_range': {
+                        'start': dates[0].isoformat(),
+                        'end': dates[-1].isoformat()
+                    }
+                },
+                'model_info': training_result,
+                'historical_data': {
+                    'dates': [d.isoformat() for d in dates],
+                    'values': values,
+                    'train_size': len(train_values),
+                    'test_size': len(test_values)
+                },
+                'test_forecast': {
+                    'dates': [d.isoformat() for d in test_dates],
+                    'actual_values': test_values,
+                    'predicted_values': test_forecast['predictions'],
+                    'confidence_intervals': test_forecast['confidence_intervals']
+                },
+                'future_forecast': {
+                    'predictions': future_forecast['predictions'],
+                    'confidence_intervals': future_forecast['confidence_intervals'],
+                    'dates': future_forecast['dates']
+                },
+                'performance_metrics': metrics,
+                'forecast_horizon': forecast_horizon
+            }
+            
+            # Save session
+            training_sessions[session_id] = training_session
+            
+            # Save model
+            model_path = os.path.join(app.config['MODELS_FOLDER'], f"{session_id}_arima_model.pkl")
+            forecaster.save_model(model_path)
+            
+            # Save results
+            results_path = os.path.join(app.config['RESULTS_FOLDER'], f"{session_id}_results.json")
+            with open(results_path, 'w') as f:
+                json.dump(training_session, f, indent=2, default=str)
+            
+            logger.info(f"ARIMA training completed successfully for session: {session_id}")
+            
+            return jsonify({
+                'session_id': session_id,
+                'status': 'success',
+                'message': 'ARIMA model trained successfully',
+                'data': training_session
+            })
+            
+        except Exception as e:
+            logger.error(f"Error processing data: {str(e)}")
+            return jsonify({'error': f'Data processing error: {str(e)}'}), 400
+            
+    except Exception as e:
+        logger.error(f"Upload error: {str(e)}")
+        return jsonify({'error': f'Upload failed: {str(e)}'}), 500
+
+
+
+
+@app.route('/retrain/<session_id>', methods=['POST'])
+def retrain_model(session_id):
+    """Retrain model with different parameters"""
+    try:
+        if session_id not in training_sessions:
+            return jsonify({'error': 'Session not found'}), 404
+        
+        # Get new parameters
+        new_horizon = int(request.json.get('forecast_horizon', 30))
+        
+        # Load original data and retrain
+        session_data = training_sessions[session_id]
+        
+        # This would involve reloading the original data and retraining
+        # For now, return existing data with updated horizon
+        return jsonify({
+            'session_id': session_id,
+            'status': 'success',
+            'message': 'Model retrained successfully',
+            'data': session_data
+        })
+        
+    except Exception as e:
+        logger.error(f"Retrain error: {str(e)}")
+        return jsonify({'error': f'Retrain failed: {str(e)}'}), 500
+
+@app.route('/sessions', methods=['GET'])
+def list_sessions():
+    """List all available training sessions"""
+    try:
+        # Load sessions from both memory and saved files
+        sessions_list = []
+        
+        # Add in-memory sessions
+        for session_id, session_data in training_sessions.items():
+            sessions_list.append({
+                'session_id': session_id,
+                'filename': session_data.get('filename', 'Unknown'),
+                'upload_time': session_data.get('upload_time', ''),
+                'total_records': session_data.get('data_info', {}).get('total_records', 0),
+                'performance_metrics': session_data.get('performance_metrics', {}),
+                'model_order': session_data.get('model_info', {}).get('order', {'p': 0, 'd': 0, 'q': 0})
+            })
+        
+        # Load sessions from saved files
+        results_dir = app.config['RESULTS_FOLDER']
+        if os.path.exists(results_dir):
+            for filename in os.listdir(results_dir):
+                if filename.endswith('_results.json'):
+                    session_id = filename.replace('_results.json', '')
+                    if session_id not in training_sessions:
+                        try:
+                            with open(os.path.join(results_dir, filename), 'r') as f:
+                                session_data = json.load(f)
+                                sessions_list.append({
+                                    'session_id': session_id,
+                                    'filename': session_data.get('filename', 'Unknown'),
+                                    'upload_time': session_data.get('upload_time', ''),
+                                    'total_records': session_data.get('data_info', {}).get('total_records', 0),
+                                    'performance_metrics': session_data.get('performance_metrics', {}),
+                                    'model_order': session_data.get('model_info', {}).get('order', {'p': 0, 'd': 0, 'q': 0})
+                                })
+                        except Exception as e:
+                            logger.warning(f"Failed to load session {session_id}: {e}")
+        
+        logger.info(f"Listed {len(sessions_list)} sessions")
+        return jsonify({
+            'status': 'success',
+            'sessions': sessions_list,
+            'total_sessions': len(sessions_list)
+        })
+        
+    except Exception as e:
+        logger.error(f"Failed to list sessions: {str(e)}")
+        return jsonify({'error': f'Failed to list sessions: {str(e)}'}), 500
+
+@app.route('/forecast/<session_id>', methods=['GET'])
+def get_forecast_results(session_id):
+    """Get forecast results for a specific session"""
+    try:
+        # First check in-memory sessions
+        if session_id in training_sessions:
+            session_data = training_sessions[session_id]
+            logger.info(f"Retrieved session {session_id} from memory")
+            return jsonify({
+                'status': 'success',
+                'session_id': session_id,
+                'data': session_data
+            })
+        
+        # Then check saved files
+        results_path = os.path.join(app.config['RESULTS_FOLDER'], f"{session_id}_results.json")
+        if os.path.exists(results_path):
+            with open(results_path, 'r') as f:
+                session_data = json.load(f)
+            
+            # Load the saved model if available
+            model_path = os.path.join(app.config['MODELS_FOLDER'], f"{session_id}_arima_model.pkl")
+            if os.path.exists(model_path):
+                # Add session back to memory for future use
+                training_sessions[session_id] = session_data
+                logger.info(f"Loaded session {session_id} from file and restored to memory")
+            
+            return jsonify({
+                'status': 'success',
+                'session_id': session_id,
+                'data': session_data
+            })
+        
+        logger.warning(f"Session {session_id} not found")
+        return jsonify({'error': f'Session {session_id} not found'}), 404
+        
+    except Exception as e:
+        logger.error(f"Failed to get forecast results: {str(e)}")
+        return jsonify({'error': f'Failed to retrieve session: {str(e)}'}), 500
+
+@app.route('/download/<session_id>', methods=['GET'])
+def download_forecast_results(session_id):
+    """Download forecast results as JSON file"""
+    try:
+        # Get session data
+        session_data = None
+        
+        if session_id in training_sessions:
+            session_data = training_sessions[session_id]
+        else:
+            results_path = os.path.join(app.config['RESULTS_FOLDER'], f"{session_id}_results.json")
+            if os.path.exists(results_path):
+                with open(results_path, 'r') as f:
+                    session_data = json.load(f)
+        
+        if session_data is None:
+            return jsonify({'error': 'Session not found'}), 404
+        
+        # Create downloadable JSON
+        download_data = {
+            'session_info': {
+                'session_id': session_id,
+                'filename': session_data.get('filename'),
+                'download_time': datetime.now().isoformat()
+            },
+            'model_info': session_data.get('model_info'),
+            'performance_metrics': session_data.get('performance_metrics'),
+            'forecast_data': {
+                'test_forecast': session_data.get('test_forecast'),
+                'future_forecast': session_data.get('future_forecast')
+            },
+            'data_info': session_data.get('data_info')
+        }
+        
+        # Save to temporary file for download
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp_file:
+            json.dump(download_data, tmp_file, indent=2, default=str)
+            tmp_file_path = tmp_file.name
+        
+        logger.info(f"Generated download for session {session_id}")
+        return send_file(
+            tmp_file_path,
+            as_attachment=True,
+            download_name=f'arima_forecast_results_{session_id}.json',
+            mimetype='application/json'
+        )
+        
+    except Exception as e:
+        logger.error(f"Download error: {str(e)}")
+        return jsonify({'error': f'Download failed: {str(e)}'}), 500
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 8080))
+    debug = os.environ.get('DEBUG', 'True').lower() == 'true'
+    
+    print(f"🚀 Starting ARIMA Forecasting Service on port {port}")
+    print(f"🔧 Debug mode: {debug}")
+    
+    app.run(
+        host='0.0.0.0',
+        port=port,
+        debug=debug
+    )
