@@ -1,7 +1,3 @@
-"""
-ARIMA Forecasting Backend API
-Final Year Project - Complete ARIMA Forecasting System
-"""
 import os
 import json
 import uuid

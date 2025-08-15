@@ -21,7 +21,6 @@ logger = logging.getLogger(__name__)
 
 class ARIMAForecaster:
     """
-    Professional ARIMA Forecasting Implementation
     
     Features:
     - Automatic order selection (p, d, q)
