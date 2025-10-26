@@ -577,6 +577,12 @@ class ARIMAForecaster:
             else:
                 directional_accuracy = 0
             
+            # Calculate accuracy percentage based on MAPE (100 - MAPE)
+            accuracy_percentage = None
+            if mape != float('inf') and mape is not None:
+                # Ensure accuracy doesn't go below 0%
+                accuracy_percentage = max(0.0, 100.0 - mape)
+            
             return {
                 'mae': float(mae),
                 'mse': float(mse),
@@ -586,7 +592,9 @@ class ARIMAForecaster:
                 'mean_actual': float(mean_actual),
                 'mean_predicted': float(mean_predicted),
                 'directional_accuracy': float(directional_accuracy),
-                'sample_size': len(actual)
+                'sample_size': len(actual),
+                # Add accuracy percentage based on MAPE (100 - MAPE)
+                'accuracy_percentage': accuracy_percentage
             }
             
         except Exception as e:
