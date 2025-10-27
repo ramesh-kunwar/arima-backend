@@ -99,7 +99,10 @@ def upload_and_train():
             value_column = request.form.get('value_column', 'value')
             test_size = float(request.form.get('test_size', 0.2))
             forecast_horizon = int(request.form.get('forecast_horizon', 7))
-
+            # Custom PDQ parameters
+            custom_p = request.form.get('p')
+            custom_d = request.form.get('d')
+            custom_q = request.form.get('q')
         else:
             # Handle JSON request when no file is uploaded
             data = request.get_json() or {}
@@ -107,6 +110,16 @@ def upload_and_train():
             value_column = data.get('value_column', 'value')
             test_size = float(data.get('test_size', 0.2))
             forecast_horizon = int(data.get('forecast_horizon', 7))
+            # Custom PDQ parameters
+            custom_p = data.get('p')
+            custom_d = data.get('d')
+            custom_q = data.get('q')
+        
+        # Build custom order if all PDQ values are provided
+        custom_order = None
+        if custom_p is not None and custom_d is not None and custom_q is not None:
+            custom_order = (int(custom_p), int(custom_d), int(custom_q))
+            logger.info(f"Using custom PDQ order: {custom_order}")
         
         session_id = str(uuid.uuid4())
         
@@ -293,7 +306,12 @@ def upload_and_train():
             
             # Train ARIMA model
             logger.info("Starting ARIMA training...")
-            training_result = forecaster.fit(train_values, train_dates)
+            if custom_order:
+                logger.info(f"Training with custom order: ARIMA{custom_order}")
+                training_result = forecaster.fit(train_values, train_dates, order=custom_order)
+            else:
+                logger.info("Training with automatic order selection")
+                training_result = forecaster.fit(train_values, train_dates)
             
             # Generate forecasts for test period
             test_forecast = forecaster.forecast(len(test_values))
@@ -323,17 +341,6 @@ def upload_and_train():
                 print(f"MSE (Mean Squared Error): {metrics['mse']:.4f}")
             if 'rmse' in metrics:
                 print(f"RMSE (Root Mean Squared Error): {metrics['rmse']:.4f}")
-            if 'r2' in metrics:
-                r2_value = metrics['r2']
-            print(f"R² (R-squared): {r2_value:.4f}")
-            if r2_value >= 0.8:
-                print("🎯 EXCELLENT: R² ≥ 0.80 - Target achieved!")
-            elif r2_value >= 0.6:
-                print("✅ GOOD: R² ≥ 0.60 - Model performing well")
-            elif r2_value >= 0.3:
-                print("⚠️  FAIR: R² ≥ 0.30 - Model has predictive value")
-            else:
-                print("❌ POOR: R² < 0.30 - Model needs improvement")
             if 'mape' in metrics and metrics['mape'] is not None:
                 print(f"MAPE (Mean Absolute Percentage Error): {metrics['mape']:.2f}%")
             if 'directional_accuracy' in metrics:
@@ -597,7 +604,12 @@ def train_with_default():
             
             # Train ARIMA model
             logger.info("Starting ARIMA training...")
-            training_result = forecaster.fit(train_values, train_dates)
+            if custom_order:
+                logger.info(f"Training with custom order: ARIMA{custom_order}")
+                training_result = forecaster.fit(train_values, train_dates, order=custom_order)
+            else:
+                logger.info("Training with automatic order selection")
+                training_result = forecaster.fit(train_values, train_dates)
             
             # Generate forecasts for test period
             test_forecast = forecaster.forecast(len(test_values))
@@ -627,17 +639,6 @@ def train_with_default():
                 print(f"MSE (Mean Squared Error): {metrics['mse']:.4f}")
             if 'rmse' in metrics:
                 print(f"RMSE (Root Mean Squared Error): {metrics['rmse']:.4f}")
-            if 'r2' in metrics:
-                r2_value = metrics['r2']
-            print(f"R² (R-squared): {r2_value:.4f}")
-            if r2_value >= 0.8:
-                print("🎯 EXCELLENT: R² ≥ 0.80 - Target achieved!")
-            elif r2_value >= 0.6:
-                print("✅ GOOD: R² ≥ 0.60 - Model performing well")
-            elif r2_value >= 0.3:
-                print("⚠️  FAIR: R² ≥ 0.30 - Model has predictive value")
-            else:
-                print("❌ POOR: R² < 0.30 - Model needs improvement")
             if 'mape' in metrics and metrics['mape'] is not None:
                 print(f"MAPE (Mean Absolute Percentage Error): {metrics['mape']:.2f}%")
             if 'directional_accuracy' in metrics:

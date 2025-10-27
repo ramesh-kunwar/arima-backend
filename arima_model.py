@@ -144,7 +144,7 @@ class ARIMAForecaster:
         logger.warning(f"No good stationarity found, using d=1 for trend capture")
         return 1
     
-    def auto_select_order(self, timeseries: List[float], max_p: int = 5, max_q: int = 5) -> Tuple[int, int, int]:
+    def auto_select_order(self, timeseries: List[float], max_p: int = 10, max_q: int = 10) -> Tuple[int, int, int]:
         """
         Automatically select optimal ARIMA order (p, d, q) using enhanced criteria
         Focus on achieving high R² performance through comprehensive model testing
@@ -186,8 +186,7 @@ class ARIMAForecaster:
         
         for p, q in search_combinations:
             try:
-                # model = ARIMA(timeseries, order=(p, d, q))
-                model = ARIMA(timeseries, order=(4,1,2))
+                model = ARIMA(timeseries, order=(p, d, q))
                 fitted_model = model.fit()
                 aic = fitted_model.aic
                 bic = fitted_model.bic
@@ -562,9 +561,6 @@ class ARIMAForecaster:
             else:
                 mape = float('inf')
             
-            # R-squared
-            r2 = r2_score(actual, predicted)
-            
             # Additional metrics
             mean_actual = np.mean(actual)
             mean_predicted = np.mean(predicted)
@@ -588,7 +584,6 @@ class ARIMAForecaster:
                 'mse': float(mse),
                 'rmse': float(rmse),
                 'mape': float(mape) if mape != float('inf') else None,
-                'r2': float(r2),
                 'mean_actual': float(mean_actual),
                 'mean_predicted': float(mean_predicted),
                 'directional_accuracy': float(directional_accuracy),
