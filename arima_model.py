@@ -2,7 +2,7 @@
 import numpy as np
 import pandas as pd
 from statsmodels.tsa.arima.model import ARIMA
-from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.stattools import adfuller, kpss
 from statsmodels.tsa.seasonal import seasonal_decompose
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from sklearn.metrics import mean_squared_error, mean_absolute_error
@@ -63,86 +63,80 @@ class ARIMAForecaster:
                 'error': str(e)
             }
     
+    def calculate_acf_decay(self, timeseries: np.ndarray, nlags: int = 10) -> float:
+        """
+        Calculate ACF decay rate - measures how quickly autocorrelation drops
+        Higher decay = better stationarity (ACF drops to 0 faster)
+        """
+        try:
+            from statsmodels.graphics.tsaplots import acf
+            acf_vals = acf(timeseries, nlags=min(nlags, len(timeseries)//2), fft=False)
+            # Exclude lag 0 (always 1.0), calculate mean absolute ACF values
+            acf_decay = np.mean(np.abs(acf_vals[1:])) if len(acf_vals) > 1 else 1.0
+            return acf_decay
+        except Exception as e:
+            logger.debug(f"ACF calculation error: {str(e)}")
+            return 1.0
+    
     def find_differencing_order(self, timeseries: List[float], max_d: int = 2) -> int:
         """
-        Find the optimal differencing order with enhanced trend analysis for high R² performance
+        Find optimal differencing order using ADF test and ACF decay analysis
+        Combines stationarity test (ADF p-value) with autocorrelation decay pattern
         """
         original_series = np.array(timeseries)
         
-        # Enhanced trend detection and analysis
-        if len(original_series) > 10:
-            x = np.arange(len(original_series))
-            
-            # Linear trend analysis
-            linear_coef = np.polyfit(x, original_series, 1)
-            linear_slope = linear_coef[0]
-            linear_r2 = np.corrcoef(x, original_series)[0, 1] ** 2
-            
-            # Quadratic trend analysis  
-            if len(original_series) > 20:
-                quad_coef = np.polyfit(x, original_series, 2)
-                quad_fitted = np.polyval(quad_coef, x)
-                quad_r2 = 1 - np.sum((original_series - quad_fitted)**2) / np.sum((original_series - np.mean(original_series))**2)
-            else:
-                quad_r2 = 0
-            
-            trend_strength = abs(linear_slope) / np.std(original_series) if np.std(original_series) > 0 else 0
-            
-            logger.info(f"Trend analysis - Linear R²: {linear_r2:.3f}, Quad R²: {quad_r2:.3f}, Strength: {trend_strength:.3f}")
-            
-            # Enhanced decision logic for differencing based on trend characteristics
-            if linear_r2 > 0.85 or quad_r2 > 0.85:  # Very strong trend
-                logger.info(f"Very strong trend detected (Linear R²: {linear_r2:.3f}, Quad R²: {quad_r2:.3f}), using d=1")
-                return 1
-            elif linear_r2 > 0.7 or quad_r2 > 0.7:  # Strong trend
-                logger.info(f"Strong trend detected (Linear R²: {linear_r2:.3f}), testing d=1 first")
-                test_order = [1, 0] if max_d >= 1 else [1]
-            elif linear_r2 > 0.4 or trend_strength > 0.08:  # Moderate trend
-                logger.info(f"Moderate trend detected (Linear R²: {linear_r2:.3f}), testing d=1 and d=0")
-                test_order = [1, 0, 2] if max_d >= 2 else [1, 0]
-            elif linear_r2 > 0.2 or trend_strength > 0.03:  # Weak trend
-                logger.info(f"Weak trend detected (Linear R²: {linear_r2:.3f}), balanced testing")
-                test_order = [0, 1, 2] if max_d >= 2 else [0, 1]
-            else:  # No clear trend
-                logger.info("No clear trend detected, testing stationary first")
-                test_order = [0, 1, 2] if max_d >= 2 else [0, 1]
-        else:
-            test_order = list(range(max_d + 1))
-        
-        # Test stationarity for each differencing order
         best_d = 1  # Default fallback
-        best_p_value = float('inf')
+        best_score = float('inf')  # Combined score: lower is better
+        
+        test_order = list(range(min(max_d + 1, 3)))
+        logger.info(f"Testing differencing orders: {test_order}")
         
         for d in test_order:
             if d == 0:
-                test_series = original_series
+                test_series = original_series.copy()
             else:
                 test_series = original_series.copy()
                 for _ in range(d):
                     test_series = np.diff(test_series)
             
             if len(test_series) < 15:  # Need sufficient data for reliable testing
+                logger.info(f"d={d}: Skipped (insufficient data after differencing: {len(test_series)} points)")
                 continue
-                
+            
+            # ADF test for stationarity
             stationarity = self.check_stationarity(test_series)
-            p_value = stationarity.get('p_value', 1.0)
+            adf_p_value = stationarity.get('p_value', 1.0)
             
-            # Track the best p-value (most stationary)
-            if p_value < best_p_value:
-                best_p_value = p_value
-                best_d = d
+            # ACF decay analysis
+            acf_decay = self.calculate_acf_decay(test_series, nlags=min(10, len(test_series)//4))
             
-            if stationarity['is_stationary'] and p_value < 0.01:  # Strong stationarity
-                logger.info(f"Strong stationarity achieved with d={d} (p-value: {p_value:.4f})")
+            # KPSS test (null hypothesis: stationary, opposite of ADF)
+            try:
+                kpss_result = kpss(test_series, regression='c', nlags='auto')
+                kpss_p_value = kpss_result[1]
+                kpss_is_stationary = kpss_p_value > 0.05
+            except:
+                kpss_p_value = 1.0
+                kpss_is_stationary = False
+            
+            # Combined scoring: ADF p-value (lower better) + ACF decay (lower better)
+            # Weight: ADF 70%, ACF 30%
+            combined_score = (0.7 * adf_p_value) + (0.3 * acf_decay)
+            
+            logger.info(f"d={d} | ADF p-value: {adf_p_value:.4f} | ACF decay: {acf_decay:.4f} | KPSS stationary: {kpss_is_stationary} | Score: {combined_score:.4f}")
+            
+            # Strong stationarity: ADF and KPSS both agree
+            if adf_p_value < 0.01 and kpss_is_stationary:
+                logger.info(f"✓ Strong stationarity achieved with d={d} (ADF p={adf_p_value:.4f}, ACF decay={acf_decay:.4f})")
                 return d
+            
+            # Track best overall score
+            if combined_score < best_score:
+                best_score = combined_score
+                best_d = d
         
-        # If no strong stationarity found, use the best option
-        if best_p_value < 0.1:  # Acceptable stationarity
-            logger.info(f"Using d={best_d} with p-value: {best_p_value:.4f}")
-            return best_d
-        
-        logger.warning(f"No good stationarity found, using d=1 for trend capture")
-        return 1
+        logger.info(f"✓ Selected d={best_d} with combined score: {best_score:.4f}")
+        return best_d
     
     def auto_select_order(self, timeseries: List[float], max_p: int = 5, max_q: int = 5) -> Tuple[int, int, int]:
         """
