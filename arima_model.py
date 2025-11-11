@@ -5,7 +5,7 @@ from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.stattools import adfuller
 from statsmodels.tsa.seasonal import seasonal_decompose
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.metrics import mean_squared_error, mean_absolute_error
 import matplotlib.pyplot as plt
 import warnings
 import joblib
@@ -144,28 +144,27 @@ class ARIMAForecaster:
         logger.warning(f"No good stationarity found, using d=1 for trend capture")
         return 1
     
-    def auto_select_order(self, timeseries: List[float], max_p: int = 10, max_q: int = 10) -> Tuple[int, int, int]:
+    def auto_select_order(self, timeseries: List[float], max_p: int = 5, max_q: int = 5) -> Tuple[int, int, int]:
         """
-        Automatically select optimal ARIMA order (p, d, q) using enhanced criteria
-        Focus on achieving high R² performance through comprehensive model testing
+        Automatically select optimal ARIMA order (p, d, q) using AIC/BIC criteria
+        Optimized for faster training with reduced search space (p≤5, q≤5)
         """
-        logger.info("Starting optimized automatic order selection for high R² performance...")
+        logger.info("Starting automatic order selection using AIC/BIC criteria (optimized search)...")
         
         # Find differencing order with more sophisticated approach
         d = self.find_differencing_order(timeseries)
         
-        # Grid search for p and q with R² optimization focus
-        best_score = float('inf')
+        # Grid search for p and q with AIC/BIC optimization focus
+        best_aic = float('inf')
         best_order = None
-        best_r2 = -float('inf')
         results = []
         
         # Smart search strategy: prioritize promising combinations first
-        # Phase 1: Test high-performing combinations
+        # Phase 1: Test high-performing combinations (reduced to p≤5, q≤5 for speed)
         priority_combinations = [
-            (2, 1), (3, 1), (1, 2), (2, 2), (3, 2), (4, 1), (1, 3), (2, 3),
-            (5, 1), (4, 2), (3, 3), (1, 4), (5, 2), (4, 3), (2, 4), (3, 4),
-            (5, 3), (4, 4), (5, 4), (1, 5), (2, 5), (3, 5), (4, 5), (5, 5)
+            (2, 1), (3, 1), (1, 2), (2, 2), (3, 2), (1, 1),
+            (4, 1), (1, 3), (2, 3), (3, 3), (4, 2), (2, 4),
+            (4, 3), (3, 4), (5, 1), (5, 2), (1, 5), (5, 3)
         ]
         
         # Filter valid combinations within our limits
@@ -191,71 +190,6 @@ class ARIMAForecaster:
                 aic = fitted_model.aic
                 bic = fitted_model.bic
                 
-                # Enhanced R² calculation with cross-validation approach
-                fitted_values = fitted_model.fittedvalues
-                if len(fitted_values) > 0:
-                    # Calculate R² against actual values
-                    y_true = np.array(timeseries[-len(fitted_values):])
-                    y_pred = fitted_values
-                    
-                    # Primary R² calculation
-                    ss_res = np.sum((y_true - y_pred) ** 2)
-                    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
-                    r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else -1
-                    
-                    # Enhanced validation: Out-of-sample testing for better R² estimate
-                    if len(timeseries) > 30:  # Only if enough data
-                        # Take last 20% for validation
-                        validation_size = max(5, int(len(timeseries) * 0.2))
-                        train_subset = timeseries[:-validation_size]
-                        valid_subset = timeseries[-validation_size:]
-                        
-                        try:
-                            # Train on subset and test on validation
-                            temp_model = ARIMA(train_subset, order=(p, d, q))
-                            temp_fitted = temp_model.fit()
-                            
-                            # Forecast validation period
-                            validation_forecast = temp_fitted.forecast(steps=validation_size)
-                            
-                            # Calculate out-of-sample R²
-                            val_ss_res = np.sum((valid_subset - validation_forecast) ** 2)
-                            val_ss_tot = np.sum((valid_subset - np.mean(valid_subset)) ** 2)
-                            validation_r2 = 1 - (val_ss_res / val_ss_tot) if val_ss_tot > 0 else -1
-                            
-                            # Use weighted average (70% in-sample, 30% out-of-sample)
-                            r2 = 0.7 * r2 + 0.3 * validation_r2
-                            
-                        except:
-                            pass  # Use original R² if validation fails
-                else:
-                    r2 = -1
-                
-                # Enhanced scoring system prioritizing R²
-                # 1. Heavy R² bonus (primary optimization target)
-                r2_bonus = r2 * 1000 if r2 > 0 else r2 * 500  # Strong penalty for negative R²
-                
-                # 2. Model complexity consideration
-                complexity_penalty = (p + q) * 2
-                
-                # 3. AIC consideration (but secondary to R²)
-                aic_penalty = aic * 0.1
-                
-                # 4. Stationarity and convergence bonuses
-                stationarity_bonus = -10 if d > 0 else 0
-                
-                # 5. Check for forecast stability
-                try:
-                    test_forecast = fitted_model.forecast(steps=7)
-                    forecast_var = np.var(test_forecast) if len(test_forecast) > 1 else 0
-                    stability_bonus = -5 if 0.1 < forecast_var < 10000 else 10
-                except:
-                    stability_bonus = 20  # Penalty for unstable forecasts
-                
-                # Combined score (negative because we want to minimize)
-                # Higher R² = more negative r2_bonus = better (lower) score
-                adjusted_score = aic_penalty + complexity_penalty - r2_bonus + stability_bonus - stationarity_bonus
-                
                 # Check for convergence issues
                 converged = True
                 if hasattr(fitted_model, 'mle_retvals') and fitted_model.mle_retvals:
@@ -266,45 +200,41 @@ class ARIMAForecaster:
                         'order': (p, d, q),
                         'aic': aic,
                         'bic': bic,
-                        'r2': r2,
-                        'adjusted_score': adjusted_score,
-                        'log_likelihood': fitted_model.llf,
-                        'r2_bonus': r2_bonus,
-                        'stability_bonus': stability_bonus
+                        'log_likelihood': fitted_model.llf
                     })
                     
-                    # Update best model based on combined score and R²
-                    if (adjusted_score < best_score) or (r2 > best_r2 and r2 > 0.5):
-                        best_score = adjusted_score
+                    # Update best model based on AIC (primary criterion)
+                    # AIC penalizes model complexity naturally
+                    if aic < best_aic:
+                        best_aic = aic
                         best_order = (p, d, q)
-                        best_r2 = r2
                         
-                    logger.debug(f"ARIMA{(p, d, q)} - AIC: {aic:.2f}, R²: {r2:.4f}, Score: {adjusted_score:.2f}")
+                    logger.debug(f"ARIMA{(p, d, q)} - AIC: {aic:.2f}, BIC: {bic:.2f}")
+                    logger.info(f"Tested ARIMA{(p, d, q)}: AIC={aic:.2f} (Best so far: {best_aic:.2f})")
                 
             except Exception as e:
                 logger.debug(f"Failed to fit ARIMA{(p, d, q)}: {str(e)}")
                 continue
         
-        # Fallback strategy with focus on capturing trends
-        if best_order is None or best_r2 < 0:
-            logger.warning("Auto-selection failed to find good R², trying trend-focused models...")
+        # Fallback strategy if auto-selection found no valid models
+        if best_order is None:
+            logger.warning("Auto-selection failed, trying fallback trend-focused models...")
             # Try specific orders known to work well with trending data
             fallback_orders = [(2, 1, 2), (3, 1, 2), (2, 2, 2), (1, 1, 1), (3, 1, 3)]
+            best_fallback_aic = float('inf')
+            
             for order in fallback_orders:
                 try:
                     model = ARIMA(timeseries, order=order)
                     fitted_model = model.fit()
-                    fitted_values = fitted_model.fittedvalues
-                    if len(fitted_values) > 0:
-                        y_true = np.array(timeseries[-len(fitted_values):])
-                        y_pred = fitted_values
-                        ss_res = np.sum((y_true - y_pred) ** 2)
-                        ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
-                        r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else -1
-                        if r2 > best_r2:
-                            best_order = order
-                            best_r2 = r2
-                            logger.info(f"Fallback selected: ARIMA{order} with R²: {r2:.4f}")
+                    aic = fitted_model.aic
+                    bic = fitted_model.bic
+                    
+                    if aic < best_fallback_aic:
+                        best_fallback_aic = aic
+                        best_order = order
+                        best_aic = aic
+                        logger.info(f"Fallback selected: ARIMA{order} with AIC: {aic:.2f}")
                 except:
                     continue
         
@@ -313,8 +243,8 @@ class ARIMAForecaster:
             best_order = (2, 1, 2)
         
         actual_aic = next((r['aic'] for r in results if r['order'] == best_order), 'N/A')
-        actual_r2 = next((r['r2'] for r in results if r['order'] == best_order), best_r2)
-        logger.info(f"Optimized selection: ARIMA{best_order} with AIC: {actual_aic}, R²: {actual_r2:.4f}")
+        actual_bic = next((r['bic'] for r in results if r['order'] == best_order), 'N/A')
+        logger.info(f"✓ Optimized model selection: ARIMA{best_order} with AIC: {actual_aic}, BIC: {actual_bic} (tested {len(results)} models)")
         
         return best_order
     
